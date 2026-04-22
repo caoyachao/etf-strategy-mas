@@ -14,7 +14,6 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -32,6 +31,10 @@ from langgraph.prebuilt import ToolNode
 
 # 回测引擎
 from backtest.backtest_engine import run_backtest, ETFBacktestEngine
+
+# LLM 桥接层 & 输出管理
+from agents.openclaw_llm import get_llm
+from utils.output_manager import OutputManager
 
 # 加载 .env 文件（如果存在）
 load_dotenv()
@@ -68,100 +71,6 @@ OUTPUT_DIR = Path("./output")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LLM 接口层（Kimi / Moonshot AI）
-# ─────────────────────────────────────────────────────────────────────────────
-
-class LLMInterface:
-    """LLM 调用抽象层"""
-    def __init__(self, agent_role: str = "default"):
-        self.agent_role = agent_role
-
-    def call(self, prompt: str) -> str:
-        raise NotImplementedError
-
-
-class OpenClawLLM(LLMInterface):
-    """
-    通过 OpenClaw CLI 调用 Agent。
-    复用 OpenClaw 已有的 provider 配置和智能体定义，无需额外 API Key。
-    """
-
-    # 角色 -> OpenClaw Agent ID 的映射
-    ROLE_AGENT_MAP = {
-        "tech_analyst": "main",
-        "fundamental_analyst": "main",
-        "sentiment_analyst": "main",
-        "strategy_dev": "main",
-        "document_writer": "main",
-    }
-
-    def __init__(self, agent_role: str = "default"):
-        super().__init__(agent_role)
-        # 允许通过环境变量自定义映射
-        env_map = os.getenv("OPENCLAW_ROLE_MAP", "")
-        if env_map:
-            for pair in env_map.split(","):
-                if "=" in pair:
-                    role, agent_id = pair.split("=", 1)
-                    self.ROLE_AGENT_MAP[role.strip()] = agent_id.strip()
-
-    def call(self, prompt: str) -> str:
-        agent_id = self.ROLE_AGENT_MAP.get(self.agent_role, "main")
-        turn_timeout = int(os.getenv("OPENCLAW_TIMEOUT", "120"))
-
-        result = subprocess.run(
-            [
-                "openclaw", "agent",
-                "--agent", agent_id,
-                "--message", prompt,
-                "--json",
-                "--timeout", str(turn_timeout),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=turn_timeout + 20,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"openclaw agent --agent {agent_id} failed "
-                f"(exit {result.returncode}): {result.stderr[:400]}"
-            )
-
-        try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"Failed to parse JSON from openclaw agent {agent_id}: {exc}\n"
-                f"Raw output: {result.stdout[:500]}"
-            ) from exc
-
-        payloads = data.get("result", {}).get("payloads", [])
-        if not payloads:
-            raise RuntimeError(f"No payloads in openclaw response for agent {agent_id}")
-
-        text = payloads[0].get("text", "")
-        aborted = data.get("result", {}).get("meta", {}).get("aborted", False)
-        if aborted:
-            raise RuntimeError(f"Agent {agent_id} turn was aborted by runtime")
-        return text
-
-
-def get_llm(agent_role: str) -> LLMInterface:
-    """
-    获取指定角色的 LLM 实例。
-    通过 OpenClaw CLI 调用 Agent，复用已有 provider 配置。
-    """
-    try:
-        return OpenClawLLM(agent_role=agent_role)
-    except Exception as e:
-        raise RuntimeError(
-            f"OpenClaw LLM 初始化失败: {e}\n"
-            f"请确认 openclaw 命令已安装且可用。"
-        ) from e
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # State 定义
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -181,75 +90,6 @@ class StrategyState(TypedDict):
     messages: Annotated[List[Dict], operator.add]
     feedback: str
     final_document: str
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 输出管理
-# ─────────────────────────────────────────────────────────────────────────────
-
-class OutputManager:
-    def __init__(self, output_dir: Path, task_id: str):
-        self.output_dir = output_dir
-        self.task_id = task_id
-        output_dir.mkdir(parents=True, exist_ok=True)
-        self._transcript_path = output_dir / "transcript.md"
-        self._status_path = output_dir / "status.json"
-        self._result_path = output_dir / "result.md"
-        self._strategy_path = output_dir / "strategy.py"
-        self._report_path = output_dir / "report.md"
-
-        self._transcript_path.write_text(f"# Transcript — {task_id}\n\n")
-        self._write_status("running", "")
-
-    def log(self, node_name: str, content: str, node_type: str = "node") -> None:
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        entry = f"## [{ts}] {node_name.upper()} ({node_type})\n\n{content}\n\n---\n\n"
-        with open(self._transcript_path, "a") as fh:
-            fh.write(entry)
-        preview = content[:80].replace("\n", " ")
-        print(f"[{ts}] [{node_name}] {preview}...", file=sys.stderr, flush=True)
-
-    def _write_status(self, status: str, message: str, extra: Dict | None = None) -> None:
-        data = {
-            "task_id": self.task_id,
-            "status": status,
-            "message": message,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if extra:
-            data.update(extra)
-        self._status_path.write_text(json.dumps(data, indent=2))
-
-    def save_strategy(self, code: str) -> None:
-        self._strategy_path.write_text(code)
-
-    def save_report(self, report: str) -> None:
-        self._report_path.write_text(report)
-
-    def complete(self, result: str, steps: int, metrics: Dict) -> None:
-        self._write_status("complete", f"Completed in {steps} iterations", {"steps": steps, "metrics": metrics})
-        fm = (
-            f"---\n"
-            f"task_id: {self.task_id}\n"
-            f"status: complete\n"
-            f"iterations: {steps}\n"
-            f"timestamp: {datetime.now(timezone.utc).isoformat()}\n"
-            f"---\n\n"
-        )
-        self._result_path.write_text(fm + result)
-
-    def error(self, exc: Exception, steps: int, tb_str: str = "") -> None:
-        msg = str(exc)[:400]
-        self._write_status("error", msg, {"steps": steps})
-        fm = (
-            f"---\n"
-            f"task_id: {self.task_id}\n"
-            f"status: error\n"
-            f"steps: {steps}\n"
-            f"timestamp: {datetime.now(timezone.utc).isoformat()}\n"
-            f"---\n\n"
-        )
-        self._result_path.write_text(fm + f"ERROR: {msg}\n\n```\n{tb_str or msg}\n```\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
