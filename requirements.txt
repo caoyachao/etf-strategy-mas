@@ -1,0 +1,6 @@
+langgraph>=0.6.11,<0.7
+langchain-core>=0.3,<0.4
+pandas>=2.0.0
+numpy>=1.24.0
+baostock>=0.8.8
+python-dotenv>=1.0.0
