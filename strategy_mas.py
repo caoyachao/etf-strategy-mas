@@ -64,8 +64,8 @@ PASS_THRESHOLD = {
 
 MAX_ITERATIONS = 5
 
-BACKTEST_START = "2023-01-01"
-BACKTEST_END = "2025-12-31"
+BACKTEST_START = "2026-01-05"
+BACKTEST_END = "2026-04-22"
 
 OUTPUT_DIR = Path("./output")
 
@@ -178,46 +178,151 @@ def sentiment_analysis(state: StrategyState) -> Dict:
 
 
 def strategy_builder(state: StrategyState) -> Dict:
-    """策略构建 Agent：汇总三信号，生成策略代码"""
+    """策略构建 Agent：汇总三信号，生成策略配置（JSON）"""
     llm = get_llm("strategy_dev")
 
     prompt = (
         f"你是一位量化策略开发工程师。请基于以下三个维度的分析信号，"
-        f"编写一个完整的 Python 策略函数 `generate_signals(df)`。\n\n"
+        f"输出一个 JSON 格式的策略配置对象。\n\n"
         f"## 技术面信号\n{state['tech_signals']}\n\n"
         f"## 基本面信号\n{state['fundamental_signals']}\n\n"
         f"## 情绪面信号\n{state['sentiment_signals']}\n\n"
         f"## 要求\n"
-        f"1. 函数签名必须是: `def generate_signals(df):`\n"
-        f"2. df 包含以下列: 'open', 'high', 'low', 'close', 'volume', 'ma5', 'ma20', 'ma60', 'rsi', 'macd', 'macd_signal', 'macd_hist', 'bb_upper', 'bb_mid', 'bb_lower', 'bb_pct'\n"
-        f"3. 返回一个 pandas Series，值为 -1(看空), 0(中性), 1(看多)\n"
-        f"4. 策略逻辑应结合趋势跟踪（价格在均线上方）和均值回归（RSI超卖+布林带低位）\n"
-        f"5. 策略应适配 ETF 特性（T+1、等权重、最多同时持有3只）\n"
-        f"6. 输出必须包含完整的 Python 代码块\n"
+        f"输出必须是合法的 JSON 对象，包含以下字段（数值型）：\n"
+        f"- trend_weight: 趋势跟踪权重 (0.0-1.0)\n"
+        f"- mean_rev_weight: 均值回归权重 (0.0-1.0)\n"
+        f"- ma_period: 均线周期，可选 5, 20, 60\n"
+        f"- rsi_oversold: RSI 超卖阈值 (0-40)\n"
+        f"- rsi_overbought: RSI 超买阈值 (60-100)\n"
+        f"- bb_lower: 布林带下限分位 (0.0-0.3)\n"
+        f"- bb_upper: 布林带上限分位 (0.7-1.0)\n"
+        f"- stop_loss: 止损比例 (-0.1 到 -0.01)\n"
+        f"- take_profit: 止盈比例 (0.03 到 0.15)\n\n"
+        f"只输出 JSON，不要任何解释文字。"
     )
 
     if state.get("iteration", 0) > 0:
         prompt += (
             f"\n## 优化反馈（第 {state['iteration']} 轮迭代）\n"
             f"{state['feedback']}\n\n"
-            f"请根据反馈优化策略参数和逻辑。"
+            f"请根据反馈调整参数。"
         )
 
     response = llm.call(prompt)
 
-    # 提取代码块
-    code_match = re.search(r"```python\n(.*?)\n```", response, re.DOTALL)
-    if code_match:
-        strategy_code = code_match.group(1).strip()
-    else:
-        # 尝试提取 def generate_signals
-        func_match = re.search(r"(def generate_signals\(.*?:.*?)(?=\n##|\n\n# |$)", response, re.DOTALL)
-        strategy_code = func_match.group(1).strip() if func_match else response
+    # 尝试提取 JSON 配置
+    config = {}
+    try:
+        # 找 JSON 开始位置
+        json_start = response.find('{')
+        json_end = response.rfind('}')
+        if json_start != -1 and json_end != -1 and json_end > json_start:
+            config = json.loads(response[json_start:json_end+1])
+    except Exception:
+        pass
+
+    # 回退：用正则提取关键参数
+    if not config:
+        config = _extract_config_from_text(response)
 
     return {
-        "strategy_code": strategy_code,
+        "strategy_code": json.dumps(config, ensure_ascii=False),  # 用 JSON 字符串传递配置
         "messages": [{"node": "strategy_builder", "role": "developer", "content": response}],
         "iteration": state.get("iteration", 0) + 1,
+    }
+
+
+def _extract_config_from_text(text: str) -> Dict:
+    """从自然语言描述中提取策略参数"""
+    config = {
+        "trend_weight": 0.4,
+        "mean_rev_weight": 0.6,
+        "ma_period": 20,
+        "rsi_oversold": 30,
+        "rsi_overbought": 70,
+        "bb_lower": 0.15,
+        "bb_upper": 0.85,
+        "stop_loss": -0.03,
+        "take_profit": 0.08,
+    }
+    
+    # 尝试匹配 RSI 阈值
+    for m in re.finditer(r'RSI[^0-9]*(\d+)', text):
+        val = int(m.group(1))
+        if val < 50:
+            config["rsi_oversold"] = val
+        else:
+            config["rsi_overbought"] = val
+    
+    # 尝试匹配均线周期
+    ma_match = re.search(r'(\d+)[^\d]*日均线|MA(\d+)', text)
+    if ma_match:
+        config["ma_period"] = int(ma_match.group(1) or ma_match.group(2))
+    
+    return config
+
+
+def coding_node(state: StrategyState) -> Dict:
+    """策略编码节点：将 JSON 配置转换为可执行 Python 代码"""
+    
+    # 解析策略配置
+    try:
+        config = json.loads(state["strategy_code"])
+    except Exception:
+        config = _extract_config_from_text(state["strategy_code"])
+    
+    # 确保参数合法
+    ma_period = config.get("ma_period", 20)
+    ma_col = f"ma{ma_period}"
+    rsi_oversold = max(0, min(40, config.get("rsi_oversold", 30)))
+    rsi_overbought = max(60, min(100, config.get("rsi_overbought", 70)))
+    bb_lower = max(0.0, min(0.3, config.get("bb_lower", 0.15)))
+    bb_upper = max(0.7, min(1.0, config.get("bb_upper", 0.85)))
+    trend_w = max(0.0, min(1.0, config.get("trend_weight", 0.4)))
+    mean_w = max(0.0, min(1.0, config.get("mean_rev_weight", 0.6)))
+    
+    # 生成策略代码
+    code = f'''import pandas as pd
+import numpy as np
+
+def generate_signals(df):
+    """ETF 趋势跟踪-均值回归策略\n    
+    参数:
+    - 均线周期: {ma_period}日
+    - RSI 超卖/超买: {rsi_oversold}/{rsi_overbought}
+    - 布林带分位: {bb_lower:.2f}/{bb_upper:.2f}
+    - 趋势/均值回归权重: {trend_w:.1f}/{mean_w:.1f}
+    """
+    df = df.copy()
+    signal = pd.Series(0, index=df.index, dtype=int)
+    
+    # 趋势跟踪信号
+    trend_long = (df['close'] > df['{ma_col}']) & (df['macd_hist'] > 0)
+    trend_short = (df['close'] < df['{ma_col}']) & (df['macd_hist'] < 0)
+    
+    # 均值回归信号
+    mean_rev_long = (df['rsi'] < {rsi_oversold}) & (df['bb_pct'] < {bb_lower})
+    mean_rev_short = (df['rsi'] > {rsi_overbought}) & (df['bb_pct'] > {bb_upper})
+    
+    # 加权综合 (权重归一化)
+    tw = {trend_w}
+    mw = {mean_w}
+    total_w = tw + mw
+    
+    # 多头条件：趋势或均值回归任一触发
+    long_cond = trend_long | mean_rev_long
+    # 空头条件
+    short_cond = trend_short | mean_rev_short
+    
+    signal[long_cond] = 1
+    signal[short_cond] = -1
+    
+    return signal
+'''.strip()
+    
+    return {
+        "strategy_code": code,
+        "messages": [{"node": "coding_node", "role": "coder", "content": f"Generated code with config: {config}"}],
     }
 
 
@@ -374,6 +479,7 @@ def build_strategy_graph() -> StateGraph:
     graph.add_node("fundamental_analysis", fundamental_analysis)
     graph.add_node("sentiment_analysis", sentiment_analysis)
     graph.add_node("strategy_builder", strategy_builder)
+    graph.add_node("coding_node", coding_node)
     graph.add_node("backtest_runner", backtest_runner)
     graph.add_node("metrics_evaluator", metrics_evaluator)
     graph.add_node("document_writer", document_writer)
@@ -391,8 +497,9 @@ def build_strategy_graph() -> StateGraph:
     graph.add_edge("fundamental_analysis", "strategy_builder")
     graph.add_edge("sentiment_analysis", "strategy_builder")
 
-    # strategy_builder → backtest_runner
-    graph.add_edge("strategy_builder", "backtest_runner")
+    # strategy_builder → coding_node → backtest_runner
+    graph.add_edge("strategy_builder", "coding_node")
+    graph.add_edge("coding_node", "backtest_runner")
 
     # backtest_runner → metrics_evaluator
     graph.add_edge("backtest_runner", "metrics_evaluator")
