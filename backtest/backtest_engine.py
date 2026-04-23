@@ -238,6 +238,7 @@ class ETFBacktestEngine:
         end_date: str,
         initial_capital: float = 1_000_000.0,
         pass_threshold: Optional[Dict[str, float]] = None,
+        data: Optional[Dict[str, pd.DataFrame]] = None,
     ):
         self.etf_pool = etf_pool
         self.start_date = start_date
@@ -249,11 +250,14 @@ class ETFBacktestEngine:
             "excess_return": 0.05,
         }
 
-        # 加载数据
-        self.data: Dict[str, pd.DataFrame] = {}
-        for symbol in etf_pool:
-            df = get_etf_data(symbol, start_date, end_date)
-            self.data[symbol] = calculate_indicators(df)
+        # 加载数据（优先使用外部传入的数据，避免重复拉取）
+        if data:
+            self.data = data
+        else:
+            self.data = {}
+            for symbol in etf_pool:
+                df = get_etf_data(symbol, start_date, end_date)
+                self.data[symbol] = calculate_indicators(df)
 
         self.benchmark = calculate_indicators(
             get_benchmark_data(start_date, end_date)
@@ -464,10 +468,15 @@ def run_backtest(
     start_date: str = "2023-01-01",
     end_date: str = "2025-12-31",
     pass_threshold: Optional[Dict[str, float]] = None,
+    data: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> Dict:
     """
     主入口：接收策略代码字符串，执行回测，返回结构化结果。
     用于 LangGraph Tool Node 调用。
+    
+    Args:
+        data: 可选，外部传入的预加载数据（避免重复拉取）。
+              格式: {symbol: DataFrame}，必须已含技术指标列。
     """
     # 安全执行策略代码（提取 signal_fn 函数）
     local_ns = {}
@@ -497,6 +506,7 @@ def run_backtest(
         start_date=start_date,
         end_date=end_date,
         pass_threshold=pass_threshold,
+        data=data,
     )
 
     try:

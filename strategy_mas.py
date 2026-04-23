@@ -34,7 +34,9 @@ from backtest.backtest_engine import run_backtest, ETFBacktestEngine
 
 # LLM 桥接层 & 输出管理
 from agents.openclaw_llm import get_llm
+from utils.llm_logger import call_llm_with_log
 from utils.output_manager import OutputManager
+from utils.tracing import NodeTraceCallback
 
 # 加载 .env 文件（如果存在）
 load_dotenv()
@@ -77,10 +79,14 @@ OUTPUT_DIR = Path("./output")
 class StrategyState(TypedDict):
     task: str
     etf_pool: List[str]
+    market_data: Dict[str, Any]       # data_loader 输出：ETF 原始数据
+    tech_indicators: Dict[str, Any]   # data_loader 输出：技术指标
+    fundamental_data: Dict[str, Any]  # data_loader 输出：基本面数据
     tech_signals: str
     fundamental_signals: str
     sentiment_signals: str
     strategy_code: str
+    strategy_history: Annotated[List[Dict], operator.add]  # 每轮策略记录
     backtest_result: Dict[str, Any]
     metrics: Dict[str, Any]
     iteration: int
@@ -99,21 +105,54 @@ class StrategyState(TypedDict):
 def signal_fanout(state: StrategyState) -> Dict:
     """初始化状态，准备并行信号分析"""
     return {
-        "messages": [{"node": "signal_fanout", "role": "init", "content": f"Task: {state['task']}"}],
         "iteration": 0,
         "status": "running",
+        "__node__": "signal_fanout",
+    }
+
+
+def data_loader(state: StrategyState) -> Dict:
+    """统一数据加载节点：拉取 ETF 数据、计算技术指标、获取基本面"""
+    from backtest.data_fetcher import (
+        load_all_data,
+        get_fundamental_data,
+        get_data_summary,
+    )
+
+    print("[data_loader] 开始加载 ETF 数据...", file=sys.stderr)
+
+    # 1. 拉取所有 ETF 原始数据 + 技术指标
+    market_data = load_all_data(
+        state["etf_pool"],
+        BACKTEST_START,
+        BACKTEST_END,
+    )
+
+    # 2. 获取基本面数据
+    fundamental = get_fundamental_data(state["etf_pool"])
+
+    print(f"[data_loader] 已加载 {len(market_data)} 只 ETF 数据", file=sys.stderr)
+
+    return {
+        "market_data": market_data,
+        "fundamental_data": fundamental,
+        "messages": [{"node": "data_loader", "role": "data", "content": f"Loaded {len(market_data)} ETFs"}],
+        "__node__": "data_loader",
     }
 
 
 def tech_analysis(state: StrategyState) -> Dict:
     """技术面信号分析 Agent"""
-    llm = get_llm("tech_analyst")
-    etf_list = ", ".join(state["etf_pool"])
+    from backtest.data_fetcher import get_etf_summary_for_node
+
+    # 从 data_loader 获取的数据中提取技术面摘要
+    data = state.get("market_data", {})
+    data_summary = get_etf_summary_for_node(data, node_type="tech", n_recent=5)
 
     prompt = (
-        f"你是一位资深的技术分析专家。请对以下ETF进行技术面分析，"
-        f"输出每只ETF的技术信号评分（-1到1之间）。\n\n"
-        f"ETF池: {etf_list}\n"
+        f"你是一位资深的技术分析专家。请基于以下 ETF 的技术指标数据，"
+        f"输出每只 ETF 的技术信号评分（-1到1之间）。\n\n"
+        f"{data_summary}\n\n"
         f"分析维度: MA均线、RSI、MACD、布林带\n\n"
         f"任务: {state['task']}\n"
     )
@@ -121,23 +160,43 @@ def tech_analysis(state: StrategyState) -> Dict:
     if state.get("feedback"):
         prompt += f"\n上一轮回测反馈（如需优化参考）: {state['feedback']}\n"
 
-    response = llm.call(prompt)
+    response = call_llm_with_log("tech_analyst", prompt)
 
     return {
         "tech_signals": response,
         "messages": [{"node": "tech_analysis", "role": "analyst", "content": response}],
+        "__node__": "tech_analysis",
     }
 
 
 def fundamental_analysis(state: StrategyState) -> Dict:
     """基本面信号分析 Agent"""
-    llm = get_llm("fundamental_analyst")
-    etf_list = ", ".join(state["etf_pool"])
+    from backtest.data_fetcher import get_etf_summary_for_node
+
+    # 从 data_loader 获取的数据中提取基本面摘要
+    data = state.get("market_data", {})
+    fundamental = state.get("fundamental_data", {})
+    data_summary = get_etf_summary_for_node(data, node_type="fundamental", n_recent=5)
+
+    # 补充基本面数据（净值、溢价率、规模等）
+    fund_lines = ["## 基本面数据", ""]
+    for symbol, info in fundamental.items():
+        parts = [f"{symbol}:"]
+        if info.get("nav") is not None:
+            parts.append(f"  净值: {info['nav']:.2f}")
+        if info.get("premium") is not None:
+            parts.append(f"  溢价率: {info['premium']:.2%}")
+        if info.get("scale") is not None:
+            parts.append(f"  规模: {info['scale']:.1f}亿")
+        parts.append("")
+        fund_lines.extend(parts)
+    fund_summary = "\n".join(fund_lines)
 
     prompt = (
-        f"你是一位基本面分析专家。请对以下ETF进行基本面分析，"
-        f"输出每只ETF的基本面信号评分（-1到1之间）。\n\n"
-        f"ETF池: {etf_list}\n"
+        f"你是一位基本面分析专家。请基于以下 ETF 的基本面数据，"
+        f"输出每只 ETF 的基本面信号评分（-1到1之间）。\n\n"
+        f"{data_summary}\n\n"
+        f"{fund_summary}\n\n"
         f"分析维度: 净值、溢价率、规模变化、估值分位\n\n"
         f"任务: {state['task']}\n"
     )
@@ -145,23 +204,27 @@ def fundamental_analysis(state: StrategyState) -> Dict:
     if state.get("feedback"):
         prompt += f"\n上一轮回测反馈（如需优化参考）: {state['feedback']}\n"
 
-    response = llm.call(prompt)
+    response = call_llm_with_log("fundamental_analyst", prompt)
 
     return {
         "fundamental_signals": response,
         "messages": [{"node": "fundamental_analysis", "role": "analyst", "content": response}],
+        "__node__": "fundamental_analysis",
     }
 
 
 def sentiment_analysis(state: StrategyState) -> Dict:
     """情绪面信号分析 Agent"""
-    llm = get_llm("sentiment_analyst")
-    etf_list = ", ".join(state["etf_pool"])
+    from backtest.data_fetcher import get_etf_summary_for_node
+
+    # 从 data_loader 获取的数据中提取情绪面摘要
+    data = state.get("market_data", {})
+    data_summary = get_etf_summary_for_node(data, node_type="sentiment", n_recent=5)
 
     prompt = (
-        f"你是一位市场情绪分析专家。请对以下ETF进行情绪面分析，"
-        f"输出每只ETF的情绪信号评分（-1到1之间）。\n\n"
-        f"ETF池: {etf_list}\n"
+        f"你是一位市场情绪分析专家。请基于以下 ETF 的量价数据，"
+        f"输出每只 ETF 的情绪信号评分（-1到1之间）。\n\n"
+        f"{data_summary}\n\n"
         f"分析维度: 资金流向、成交量异动、市场情绪热度\n\n"
         f"任务: {state['task']}\n"
     )
@@ -169,17 +232,17 @@ def sentiment_analysis(state: StrategyState) -> Dict:
     if state.get("feedback"):
         prompt += f"\n上一轮回测反馈（如需优化参考）: {state['feedback']}\n"
 
-    response = llm.call(prompt)
+    response = call_llm_with_log("sentiment_analyst", prompt)
 
     return {
         "sentiment_signals": response,
         "messages": [{"node": "sentiment_analysis", "role": "analyst", "content": response}],
+        "__node__": "sentiment_analysis",
     }
 
 
 def strategy_builder(state: StrategyState) -> Dict:
     """策略构建 Agent：汇总三信号，生成策略配置（JSON）"""
-    llm = get_llm("strategy_dev")
 
     prompt = (
         f"你是一位量化策略开发工程师。请基于以下三个维度的分析信号，"
@@ -208,7 +271,7 @@ def strategy_builder(state: StrategyState) -> Dict:
             f"请根据反馈调整参数。"
         )
 
-    response = llm.call(prompt)
+    response = call_llm_with_log("strategy_dev", prompt)
 
     # 尝试提取 JSON 配置
     config = {}
@@ -229,6 +292,7 @@ def strategy_builder(state: StrategyState) -> Dict:
         "strategy_code": json.dumps(config, ensure_ascii=False),  # 用 JSON 字符串传递配置
         "messages": [{"node": "strategy_builder", "role": "developer", "content": response}],
         "iteration": state.get("iteration", 0) + 1,
+        "__node__": "strategy_builder",
     }
 
 
@@ -323,6 +387,7 @@ def generate_signals(df):
     return {
         "strategy_code": code,
         "messages": [{"node": "coding_node", "role": "coder", "content": f"Generated code with config: {config}"}],
+        "__node__": "coding_node",
     }
 
 
@@ -336,12 +401,16 @@ def backtest_runner(state: StrategyState) -> Dict:
         file=sys.stderr,
     )
 
+    # 使用 data_loader 已加载的数据，避免重复拉取
+    market_data = state.get("market_data")
+
     result = run_backtest(
         strategy_code=strategy_code,
         etf_pool=etf_pool,
         start_date=BACKTEST_START,
         end_date=BACKTEST_END,
         pass_threshold=state["pass_threshold"],
+        data=market_data,
     )
 
     return {
@@ -354,6 +423,19 @@ def backtest_runner(state: StrategyState) -> Dict:
             "trade_count": result.get("trade_count", 0),
             "win_rate": result.get("win_rate", 0),
         },
+        "strategy_history": [
+            {
+                "iteration": state.get("iteration", 0),
+                "strategy_code": strategy_code,
+                "sharpe": result.get("sharpe", 0),
+                "max_drawdown": result.get("max_drawdown", 1),
+                "excess_return": result.get("excess_return", -1),
+                "annual_return": result.get("annual_return", 0),
+                "trade_count": result.get("trade_count", 0),
+                "win_rate": result.get("win_rate", 0),
+                "passed": result.get("passed", False),
+            }
+        ],
         "messages": [
             {
                 "node": "backtest_runner",
@@ -361,6 +443,7 @@ def backtest_runner(state: StrategyState) -> Dict:
                 "content": json.dumps(result, ensure_ascii=False, default=str),
             }
         ],
+        "__node__": "backtest_runner",
     }
 
 
@@ -401,6 +484,7 @@ def metrics_evaluator(state: StrategyState) -> Dict:
                 "content": f"Passed: {passed}\nMetrics: {json.dumps(metrics)}\nFeedback: {feedback}",
             }
         ],
+        "__node__": "metrics_evaluator",
     }
 
 
@@ -427,18 +511,85 @@ def refinement_router(state: StrategyState) -> str:
     return "strategy_builder"
 
 
+def _pick_best_strategy(history: List[Dict]) -> Optional[Dict]:
+    """从历史记录中选出综合最优策略（Min-Max 归一化后加权）。
+
+    评分规则：
+    - sharpe 权重最高（归一化后 ×3）
+    - max_drawdown 越低越好（归一化后 ×-2）
+    - excess_return 越高越好（归一化后 ×1）
+
+    归一化确保三个指标在同一量级（0~1），避免数量级差异导致的权重失衡。
+    """
+    if not history:
+        return None
+
+    def _normalize(val: float, vals: List[float], higher_is_better: bool = True) -> float:
+        """Min-Max 归一化到 0~1"""
+        min_val = min(vals)
+        max_val = max(vals)
+        if max_val == min_val:
+            return 0.5
+        normalized = (val - min_val) / (max_val - min_val)
+        return normalized if higher_is_better else (1 - normalized)
+
+    # 收集各指标列表
+    sharpes = [h.get("sharpe", 0) for h in history]
+    drawdowns = [h.get("max_drawdown", 1) for h in history]
+    excesses = [h.get("excess_return", 0) for h in history]
+
+    scored = []
+    for h in history:
+        # 归一化：sharpe / excess 越高越好；drawdown 越低越好
+        ns = _normalize(h.get("sharpe", 0), sharpes, higher_is_better=True)
+        nd = _normalize(h.get("max_drawdown", 1), drawdowns, higher_is_better=False)
+        ne = _normalize(h.get("excess_return", 0), excesses, higher_is_better=True)
+
+        score = ns * 3 + nd * 2 + ne * 1
+        scored.append((score, h))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best = scored[0][1]
+
+    print(
+        f"[_pick_best_strategy] Best iteration={best['iteration']} "
+        f"score={scored[0][0]:.3f} (sharpe_norm={ns:.3f} drawdown_norm={nd:.3f} excess_norm={ne:.3f})",
+        file=sys.stderr,
+    )
+    return best
+
+
 def document_writer(state: StrategyState) -> Dict:
     """文档生成 Agent：整合所有信息输出最终报告"""
-    llm = get_llm("document_writer")
-
     metrics = state["metrics"]
     result = state["backtest_result"]
     passed = result.get("passed", False)
     iteration = state.get("iteration", 0)
 
+    # ── 迭代上限未通过时：从历史中选最优策略 ──
+    strategy_code = state["strategy_code"]
+    if not passed and iteration >= state.get("max_iterations", MAX_ITERATIONS):
+        best = _pick_best_strategy(state.get("strategy_history", []))
+        if best:
+            print(
+                f"[document_writer] 迭代上限，选用最优策略（第{best['iteration']}轮）"
+                f" sharpe={best['sharpe']:.3f} max_dd={best['max_drawdown']:.2%}",
+                file=sys.stderr,
+            )
+            strategy_code = best["strategy_code"]
+            metrics = {
+                "sharpe": best["sharpe"],
+                "max_drawdown": best["max_drawdown"],
+                "excess_return": best["excess_return"],
+                "annual_return": best.get("annual_return", 0),
+                "trade_count": best.get("trade_count", 0),
+                "win_rate": best.get("win_rate", 0),
+            }
+            result = {"passed": False, **metrics}
+
     prompt = (
         f"你是一位量化策略文档撰写专家。请基于以下信息，生成一份完整的策略报告。\n\n"
-        f"## 策略代码\n```python\n{state['strategy_code']}\n```\n\n"
+        f"## 策略代码\n```python\n{strategy_code}\n```\n\n"
         f"## 技术面分析\n{state['tech_signals']}\n\n"
         f"## 基本面分析\n{state['fundamental_signals']}\n\n"
         f"## 情绪面分析\n{state['sentiment_signals']}\n\n"
@@ -456,12 +607,16 @@ def document_writer(state: StrategyState) -> Dict:
         f"回测结果、参数说明、风险提示等章节。"
     )
 
-    response = llm.call(prompt)
+    response = call_llm_with_log("document_writer", prompt)
 
     return {
         "final_document": response,
+        "strategy_code": strategy_code,
+        "metrics": metrics,
+        "backtest_result": result,
         "status": "complete" if passed else "failed",
         "messages": [{"node": "document_writer", "role": "writer", "content": response}],
+        "__node__": "document_writer",
     }
 
 
@@ -475,6 +630,7 @@ def build_strategy_graph() -> StateGraph:
 
     # 添加节点
     graph.add_node("signal_fanout", signal_fanout)
+    graph.add_node("data_loader", data_loader)
     graph.add_node("tech_analysis", tech_analysis)
     graph.add_node("fundamental_analysis", fundamental_analysis)
     graph.add_node("sentiment_analysis", sentiment_analysis)
@@ -487,10 +643,11 @@ def build_strategy_graph() -> StateGraph:
     # 入口点
     graph.set_entry_point("signal_fanout")
 
-    # signal_fanout → 并行三个分析
-    graph.add_edge("signal_fanout", "tech_analysis")
-    graph.add_edge("signal_fanout", "fundamental_analysis")
-    graph.add_edge("signal_fanout", "sentiment_analysis")
+    # signal_fanout → data_loader → 并行三个分析
+    graph.add_edge("signal_fanout", "data_loader")
+    graph.add_edge("data_loader", "tech_analysis")
+    graph.add_edge("data_loader", "fundamental_analysis")
+    graph.add_edge("data_loader", "sentiment_analysis")
 
     # 三个分析 → strategy_builder（LangGraph 会自动等三个都完成）
     graph.add_edge("tech_analysis", "strategy_builder")
@@ -539,13 +696,21 @@ def main():
     output_dir = Path(args.output) / task_id
     out_mgr = OutputManager(output_dir, task_id)
 
+    # ── 设置 LLM 日志目录（1+2 组合方案） ──
+    llm_log_dir = output_dir / "llm_logs"
+    llm_log_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["LLM_LOG_DIR"] = str(llm_log_dir)
+
     initial_state: StrategyState = {
         "task": args.task,
         "etf_pool": DEFAULT_ETF_POOL,
+        "market_data": {},
+        "fundamental_data": {},
         "tech_signals": "",
         "fundamental_signals": "",
         "sentiment_signals": "",
         "strategy_code": "",
+        "strategy_history": [],
         "backtest_result": {},
         "metrics": {},
         "iteration": 0,
@@ -567,7 +732,9 @@ def main():
 
     try:
         graph = build_strategy_graph()
-        final_state = graph.invoke(initial_state)
+        # 初始化节点追踪回调
+        trace_callback = NodeTraceCallback(out_dir=output_dir, task_id=task_id)
+        final_state = graph.invoke(initial_state, config={"callbacks": [trace_callback]})
 
         # 保存产出
         out_mgr.save_strategy(final_state["strategy_code"])
