@@ -30,7 +30,10 @@ from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
 # 回测引擎
-from backtest.backtest_engine import run_backtest, ETFBacktestEngine
+from backtest.backtest_engine import run_backtest
+
+# 数据层
+from data import get_fundamental_data, get_etf_summary_for_node, load_all_data
 
 # LLM 桥接层 & 输出管理
 from agents.openclaw_llm import get_llm
@@ -143,8 +146,6 @@ def data_loader(state: StrategyState) -> Dict:
 
 def tech_analysis(state: StrategyState) -> Dict:
     """技术面信号分析 Agent"""
-    from backtest.data_fetcher import get_etf_summary_for_node
-
     # 从 data_loader 获取的数据中提取技术面摘要
     data = state.get("market_data", {})
     data_summary = get_etf_summary_for_node(data, node_type="tech", n_recent=5)
@@ -171,8 +172,6 @@ def tech_analysis(state: StrategyState) -> Dict:
 
 def fundamental_analysis(state: StrategyState) -> Dict:
     """基本面信号分析 Agent"""
-    from backtest.data_fetcher import get_etf_summary_for_node
-
     # 从 data_loader 获取的数据中提取基本面摘要
     data = state.get("market_data", {})
     fundamental = state.get("fundamental_data", {})
@@ -215,8 +214,6 @@ def fundamental_analysis(state: StrategyState) -> Dict:
 
 def sentiment_analysis(state: StrategyState) -> Dict:
     """情绪面信号分析 Agent"""
-    from backtest.data_fetcher import get_etf_summary_for_node
-
     # 从 data_loader 获取的数据中提取情绪面摘要
     data = state.get("market_data", {})
     data_summary = get_etf_summary_for_node(data, node_type="sentiment", n_recent=5)

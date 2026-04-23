@@ -1,153 +1,18 @@
 """
-统一数据获取与清洗模块
+数据摘要生成模块
 
-负责：
-1. 从 baostock 拉取 ETF 历史 K 线数据
-2. 计算技术指标（MA/RSI/MACD/布林带/波动率）
-3. 获取基本面数据摘要（净值、溢价率等，从 baostock 可用字段中提取）
-4. 生成供 LLM 分析用的数据摘要文本
+为 LLM 分析节点生成可读的数据摘要文本。
 
-数据源：baostock
+外部入口：
+    get_data_summary(data, fundamental, n_recent) -> str
+    get_etf_summary_for_node(data, node_type, n_recent) -> str
 """
 
-import json
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 
-from backtest.backtest_engine import (
-    get_etf_data,
-    calculate_indicators,
-    get_benchmark_data,
-    _ensure_bs_login,
-)
-
-import baostock as bs
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 统一数据加载
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_all_data(
-    etf_pool: List[str],
-    start_date: str,
-    end_date: str,
-    use_cache: bool = True,
-) -> Dict[str, pd.DataFrame]:
-    """
-    统一加载所有 ETF 数据（含技术指标）。
-
-    Returns:
-        dict: {symbol: DataFrame(...)}，每列含 date, open, high, low, close, volume,
-              ma5/20/60, rsi, macd, macd_signal, macd_hist, bb_upper/lower/mid/pct,
-              volatility_20
-    """
-    data = {}
-    for symbol in etf_pool:
-        try:
-            df = get_etf_data(symbol, start_date, end_date, use_cache)
-            df = calculate_indicators(df)
-            data[symbol] = df
-        except Exception as e:
-            print(f"[data_fetcher] 跳过 {symbol}（获取失败: {e}）", flush=True)
-            continue
-
-    if not data:
-        raise RuntimeError("所有 ETF 数据获取失败，请检查网络或 baostock 可用性。")
-
-    return data
-
-
-def get_benchmark_indicators(
-    start_date: str,
-    end_date: str,
-    use_cache: bool = True,
-) -> pd.DataFrame:
-    """获取沪深300ETF(510300)作为基准，含技术指标"""
-    df = get_benchmark_data(start_date, end_date, use_cache)
-    return calculate_indicators(df)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 基本面数据获取
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_fundamental_data(
-    etf_pool: List[str],
-    date: Optional[str] = None,
-) -> Dict[str, Dict]:
-    """
-    获取 ETF 基本面数据。
-
-    目前从 baostock 的 query_etf_info / query_etf_nav 获取，
-    若接口不可用则返回空 dict，不阻塞流程。
-
-    Returns:
-        {symbol: {"nav": float, "premium": float, "scale": float, ...}}
-    """
-    _ensure_bs_login()
-    result = {}
-
-    for symbol in etf_pool:
-        info = {"symbol": symbol}
-
-        # ETF 基本信息（净值、规模等）
-        try:
-            rs = bs.query_etf_info(code=symbol)
-            if rs.error_code == "0" and rs.next():
-                row = rs.get_row_data()
-                info["fund_name"] = row[2] if len(row) > 2 else ""
-                info["fund_manager"] = row[3] if len(row) > 3 else ""
-                info["scale"] = float(row[5]) if len(row) > 5 else None
-        except Exception:
-            pass
-
-        # ETF 净值（最新）
-        try:
-            today = date or datetime.now().strftime("%Y-%m-%d")
-            rs = bs.query_etf_nav(code=symbol, date=today)
-            if rs.error_code == "0" and rs.next():
-                row = rs.get_row_data()
-                info["nav"] = float(row[2]) if len(row) > 2 else None
-        except Exception:
-            pass
-
-        # 溢价率 = (收盘价 - 净值) / 净值
-        # 这里尝试获取最新收盘价
-        try:
-            bs_code = _get_bs_code(symbol)
-            rs = bs.query_latest_price(bs_code)
-            if rs.error_code == "0" and rs.next():
-                row = rs.get_row_data()
-                close = float(row[4]) if len(row) > 4 else None
-                if close and info.get("nav"):
-                    info["premium"] = round((close - info["nav"]) / info["nav"], 4)
-                info["latest_close"] = close
-        except Exception:
-            pass
-
-        result[symbol] = info
-
-    return result
-
-
-def _get_bs_code(symbol: str) -> str:
-    """交易所代码转换（内部复用）"""
-    prefix = symbol[:2]
-    if prefix in ("51", "52", "53", "54", "56", "58"):
-        return f"sh.{symbol}"
-    elif prefix in ("15", "16", "18"):
-        return f"sz.{symbol}"
-    return f"sh.{symbol}"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 数据摘要生成（给 LLM 分析用）
-# ─────────────────────────────────────────────────────────────────────────────
 
 def get_data_summary(
     data: Dict[str, pd.DataFrame],
@@ -170,27 +35,21 @@ def get_data_summary(
         if df.empty:
             continue
 
-        # 取最近 n 天
         recent = df.tail(n_recent).copy()
         latest = recent.iloc[-1]
 
-        # 均线
         ma20 = latest.get("ma20", np.nan)
         ma60 = latest.get("ma60", np.nan)
         ma5 = latest.get("ma5", np.nan)
-
-        # 技术指标
         rsi = latest.get("rsi", np.nan)
         macd_hist = latest.get("macd_hist", np.nan)
         bb_pct = latest.get("bb_pct", np.nan)
 
-        # 基本面
         fund = fundamental.get(symbol, {})
         nav = fund.get("nav")
         premium = fund.get("premium")
         scale = fund.get("scale")
 
-        # 近n日价格序列
         close_series = recent["close"].tolist()
         price_str = " → ".join([f"{c:.2f}" for c in close_series])
 
@@ -329,8 +188,6 @@ def _get_sentiment_summary(data: Dict[str, pd.DataFrame], n: int) -> str:
         vol = latest.get("volume", np.nan)
         vol_avg = df.tail(20)["volume"].mean()
         vol_ratio = vol / vol_avg if vol_avg > 0 else np.nan
-
-        # 近n日涨跌
         n_return = (recent["close"].iloc[-1] / recent["close"].iloc[0]) - 1 if len(recent) > 1 else 0
 
         parts = [f"{symbol}:", f"  最新价: {latest['close']:.2f}"]
@@ -339,7 +196,6 @@ def _get_sentiment_summary(data: Dict[str, pd.DataFrame], n: int) -> str:
             parts.append(f"  成交量/20日均: {vol_ratio:.2f} ({heat})")
         parts.append(f"  近{n}日涨跌幅: {n_return:.2%}")
 
-        # 连涨/连跌天数
         recent_returns = recent["return"].dropna().tolist()
         if recent_returns:
             consecutive = 0
